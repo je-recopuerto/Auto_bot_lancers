@@ -10,6 +10,10 @@ its own HTML/JSON snapshot and Telegram bot:
   LANCERS_URL1 + TELEGRAM_BOT_TOKEN1
     -> lancers_search_1.html / lancers_jobs_1.json / telegram_chat_ids_1.json
 
+When new jobs are detected, each job detail page is fetched and parsed so
+Telegram messages include client verification, ratings, schedule, and the
+fuller job description — not only search-list fields.
+
 Example:
   python lancers_fetch.py
   python lancers_fetch.py ^
@@ -23,8 +27,9 @@ import argparse
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
-from typing import Dict, List, Optional, Set
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -52,6 +57,15 @@ DEADLINE_RE = re.compile(r"あと\s*\d+\s*日|募集終了|募集中")
 APPLICANTS_RE = re.compile(
     r"当選者数\s*([\d,]+)\s*人\s*/\s*募集人数\s*([\d,]+)\s*人"
 )
+SNAPSHOT_FIELDS = (
+    "title",
+    "url",
+    "budget",
+    "applicants",
+    "deadline",
+    "summary",
+    "skills",
+)
 
 
 @dataclass
@@ -63,6 +77,33 @@ class Job:
     deadline: Optional[str]
     summary: Optional[str]
     skills: List[str]
+    # Fields filled from the job detail page (not stored in search snapshots).
+    job_id: Optional[str] = None
+    work_type: Optional[str] = None
+    category: Optional[str] = None
+    tags: List[str] = field(default_factory=list)
+    schedule: Dict[str, str] = field(default_factory=dict)
+    proposals_count: Optional[str] = None
+    favorites_count: Optional[str] = None
+    views_count: Optional[str] = None
+    in_progress_count: Optional[str] = None
+    completed_count: Optional[str] = None
+    winners: Optional[str] = None
+    capacity: Optional[str] = None
+    client_name: Optional[str] = None
+    client_url: Optional[str] = None
+    client_verifications: Dict[str, bool] = field(default_factory=dict)
+    client_rating_good: Optional[str] = None
+    client_rating_bad: Optional[str] = None
+    client_order_rate: Optional[str] = None
+    client_order_counts: Optional[str] = None
+    description: Optional[str] = None
+    propose_url: Optional[str] = None
+    detail_fetched: bool = False
+
+
+def job_to_snapshot(job: Job) -> Dict[str, object]:
+    return {name: getattr(job, name) for name in SNAPSHOT_FIELDS}
 
 
 def parse_cookie_header(raw_cookie: str) -> Dict[str, str]:
@@ -115,6 +156,50 @@ def clean_text(value: Optional[str]) -> Optional[str]:
         return None
     text = re.sub(r"\s+", " ", value).strip()
     return text or None
+
+
+TITLE_BADGE_TOKENS = (
+    "NEW",
+    "PR",
+    "初回",
+    "2回目",
+    "3回目",
+    "注目",
+    "募集中",
+)
+
+
+def clean_job_title(value: Optional[str]) -> str:
+    """Strip Lancers badge tokens (NEW / 初回 / 注目 / …) from a job title."""
+    title = clean_text(value) or ""
+    if not title:
+        return ""
+
+    # Remove leading glued badges: "NEW初回注目 Title" / "NEW Title"
+    title = re.sub(
+        r"^(?:NEW|PR|初回|2回目|3回目|注目)+\s*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+    # Remove trailing badges: "Title NEW"
+    title = re.sub(
+        r"\s*(?:NEW|PR|初回|2回目|3回目|注目)+$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Remove badge tokens anywhere they appear as whole words.
+    for token in TITLE_BADGE_TOKENS:
+        title = re.sub(
+            rf"(?<!\w){re.escape(token)}(?!\w)",
+            " ",
+            title,
+            flags=re.IGNORECASE,
+        )
+    title = re.sub(r"\s+", " ", title).strip(" -|/、,")
+    return title
 
 
 def is_waf_challenge(page_html: str) -> bool:
@@ -208,8 +293,9 @@ def job_from_card(card, base_url: str) -> Optional[Job]:
     if not title:
         return None
 
-    # Strip common badge prefixes glued into title text.
-    title = re.sub(r"^(NEW|初回|注目|NEW初回|NEW初回注目)\s*", "", title).strip()
+    title = clean_job_title(title)
+    if not title:
+        return None
 
     budget_el = card.select_one(
         ".c-media__job-price, [class*='job-price'], [class*='price']"
@@ -288,7 +374,9 @@ def extract_jobs_from_detail_links(soup: BeautifulSoup, base_url: str) -> List[J
         if not title or len(title) < 4:
             continue
 
-        title = re.sub(r"^(NEW|初回|注目|NEW初回|NEW初回注目)\s*", "", title).strip()
+        title = clean_job_title(title)
+        if not title or len(title) < 4:
+            continue
 
         card = link
         for _ in range(8):
@@ -329,9 +417,268 @@ def extract_jobs(page_html: str, base_url: str) -> List[Job]:
     return extract_jobs_from_detail_links(soup, base_url)
 
 
-def fetch_page(url: str, cookie_header: Optional[str], timeout: int) -> requests.Response:
+def escape_html(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return (
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+
+def extract_job_id(url: str) -> Optional[str]:
+    match = DETAIL_HREF_RE.search(url or "")
+    return match.group(1) if match else None
+
+
+def _definition_list_status(dt) -> bool:
+    """True when the client verification item shows a check icon."""
+    if dt is None:
+        return False
+    if dt.select_one("i.c-icon--circle-check, .c-icon--circle-check"):
+        return True
+    text = clean_text(dt.get_text(" ", strip=True)) or ""
+    return bool(text) and text not in {"--", "-", "×", "✗", "未"}
+
+
+def _col_heading_text(soup: BeautifulSoup, col_class: str) -> Optional[str]:
+    col = soup.select_one(f".tableSummary__col{col_class}")
+    if not col:
+        return None
+    heading = col.select_one(".c-heading--lv5, .c-heading")
+    return clean_text(heading.get_text(" ", strip=True)) if heading else None
+
+
+def extract_detail_budget(soup: BeautifulSoup) -> Optional[str]:
+    compensation = soup.select_one(".tableSummary__col--compensation")
+    if compensation:
+        text = clean_text(compensation.get_text(" ", strip=True)) or ""
+        # Drop work-type badge text prefix when present.
+        parsed = extract_budget(text)
+        if parsed:
+            return parsed
+        numbers = [
+            clean_text(el.get_text(" ", strip=True))
+            for el in compensation.select(".price-number")
+        ]
+        numbers = [n for n in numbers if n and n not in {"~", "〜"}]
+        units = compensation.select_one(".price-unit")
+        unit = clean_text(units.get_text(" ", strip=True)) if units else "円"
+        money = [n for n in numbers if any(ch.isdigit() for ch in n)]
+        if len(money) >= 2:
+            return f"{money[0]} - {money[1]} {unit}"
+        if len(money) == 1:
+            return f"{money[0]} {unit}"
+    return None
+
+
+def extract_client_verifications(box) -> Dict[str, bool]:
+    result: Dict[str, bool] = {}
+    if box is None:
+        return result
+    for dl in box.select(".p-work-detail-client-box-work-status__content-list"):
+        label_el = dl.select_one(
+            ".p-work-detail-client-box-work-status__content-list-item, dd"
+        )
+        status_el = dl.select_one(
+            ".p-work-detail-client-box-work-status__content-list-title, dt"
+        )
+        label = clean_text(label_el.get_text(" ", strip=True)) if label_el else None
+        if not label:
+            continue
+        result[label] = _definition_list_status(status_el)
+    return result
+
+
+def extract_proposal_status_map(soup: BeautifulSoup) -> Dict[str, str]:
+    status: Dict[str, str] = {}
+    for paragraph in soup.select(".work_detail__proposal-status p"):
+        number_el = paragraph.select_one(".work_detail__proposal-status-number")
+        if not number_el:
+            continue
+        number = clean_text(number_el.get_text(" ", strip=True))
+        label = clean_text(
+            paragraph.get_text(" ", strip=True).replace(number or "", "", 1)
+        )
+        if label and number:
+            # Strip trailing unit words like 件/人/回 for cleaner labels.
+            label = re.sub(r"(件|人|回)$", "", label).strip() or label
+            status[label] = number
+    return status
+
+
+def parse_job_detail_html(page_html: str, job: Job) -> Job:
+    """Enrich a search-list Job with fields from its detail page HTML."""
+    soup = BeautifulSoup(page_html, "html.parser")
+    job.detail_fetched = True
+    job.job_id = extract_job_id(job.url) or job.job_id
+
+    h1 = soup.select_one("h1.c-heading--lv1, h1.c-heading")
+    if h1:
+        # Clone-ish: prefer direct text nodes, fall back to full text without sub.
+        sub = h1.select_one(".c-heading__sub")
+        if sub:
+            job.category = clean_text(sub.get_text(" ", strip=True))
+            sub.extract()
+        title = clean_text(h1.get_text(" ", strip=True))
+        title = clean_job_title(title)
+        if title:
+            job.title = title
+
+    work_type = soup.select_one(
+        ".tableSummary__col--compensation .c-badge__text, .c-badge__text"
+    )
+    if work_type:
+        job.work_type = clean_text(work_type.get_text(" ", strip=True))
+
+    detail_budget = extract_detail_budget(soup)
+    if detail_budget:
+        job.budget = detail_budget
+
+    deadline_left = _col_heading_text(soup, "--time")
+    if deadline_left:
+        job.deadline = f"あと{deadline_left}" if not deadline_left.startswith("あと") else deadline_left
+
+    proposals_heading = _col_heading_text(soup, "--worksNum")
+    if proposals_heading:
+        job.proposals_count = proposals_heading.replace("件", "").strip()
+
+    winners_col = soup.select_one(".tableSummary__col--WinnerNum")
+    if winners_col:
+        winners_heading = winners_col.select_one(".c-heading--lv5, .c-heading")
+        if winners_heading:
+            job.winners = clean_text(
+                winners_heading.get_text(" ", strip=True).replace("件", "")
+            )
+        capacity_match = re.search(
+            r"募集人数\s*([\d,]+)\s*人",
+            winners_col.get_text(" ", strip=True),
+        )
+        if capacity_match:
+            job.capacity = capacity_match.group(1)
+        if job.winners and job.capacity:
+            job.applicants = (
+                f"Applicants: {job.winners} / Capacity: {job.capacity}"
+            )
+
+    tags: List[str] = []
+    for li in soup.select("ul.c-lists li.c-tag"):
+        text = clean_text(li.get_text(" ", strip=True))
+        if text and text not in tags:
+            tags.append(text)
+    job.tags = tags[:12]
+
+    schedule: Dict[str, str] = {}
+    for item in soup.select(".p-work-detail-schedule__item"):
+        title_el = item.select_one(".p-work-detail-schedule__item__title")
+        value_el = item.select_one(".p-work-detail-schedule__text")
+        key = clean_text(title_el.get_text(" ", strip=True)) if title_el else None
+        value = clean_text(value_el.get_text(" ", strip=True)) if value_el else None
+        if key and value:
+            schedule[key.rstrip("：:")] = value
+    job.schedule = schedule
+
+    status_map = extract_proposal_status_map(soup)
+    job.proposals_count = status_map.get("提案数", job.proposals_count)
+    job.favorites_count = status_map.get("お気に入り", job.favorites_count)
+    job.views_count = status_map.get("閲覧数", job.views_count)
+    job.in_progress_count = status_map.get("進行中", job.in_progress_count)
+    job.completed_count = status_map.get("完了数", job.completed_count)
+
+    box = soup.select_one(".p-work-detail-client-box")
+    if box:
+        name_el = box.select_one(".client_name a.c-link, a.c-link")
+        if name_el:
+            job.client_name = clean_text(name_el.get_text(" ", strip=True))
+            href = (name_el.get("href") or "").strip()
+            if href:
+                job.client_url = abs_url(job.url, href.split("?")[0])
+        job.client_verifications = extract_client_verifications(box)
+
+        good = box.select_one(
+            ".p-work-detail-client-box-feedback-info__number-good"
+        )
+        bad = box.select_one(
+            ".p-work-detail-client-box-feedback-info__number-bad"
+        )
+        if good:
+            job.client_rating_good = clean_text(good.get_text(" ", strip=True))
+        if bad:
+            job.client_rating_bad = clean_text(bad.get_text(" ", strip=True))
+
+        rate = box.select_one(".p-work-detail-client-box-feedback-info__percent")
+        if rate:
+            job.client_order_rate = clean_text(rate.get_text(" ", strip=True))
+        awarded = box.select_one(".result_summary_awarded")
+        posted = box.select_one(".result_summary_posted")
+        if awarded and posted:
+            job.client_order_counts = (
+                f"{clean_text(awarded.get_text(' ', strip=True))} / "
+                f"{clean_text(posted.get_text(' ', strip=True))}"
+            )
+
+    desc_el = soup.select_one(
+        ".p-work-detail-lancer__postscript-description, "
+        "dd.p-work-detail-lancer__postscript-description"
+    )
+    if desc_el:
+        # Preserve light paragraph breaks from <br>.
+        for br in desc_el.find_all("br"):
+            br.replace_with("\n")
+        description = desc_el.get_text("\n", strip=True)
+        description = re.sub(r"\n{3,}", "\n\n", description).strip()
+        if description:
+            job.description = description
+            if not job.summary:
+                job.summary = clean_text(description[:240])
+
+    if job.job_id:
+        job.propose_url = abs_url(job.url, f"/work/propose_start/{job.job_id}")
+
+    return job
+
+
+def enrich_job_from_detail(
+    job: Job,
+    cookie_header: Optional[str],
+    timeout: int,
+    referer: str,
+) -> Tuple[Job, Optional[str]]:
+    """
+    Fetch the job detail page and enrich the Job.
+
+    Returns (job, error_message). error_message is set when enrichment failed
+    but the original search-list fields are still usable.
+    """
+    if not job.url:
+        return job, "missing job URL"
+
+    try:
+        response = fetch_page(
+            job.url, cookie_header, timeout, referer=referer or job.url
+        )
+    except requests.RequestException as exc:
+        return job, f"detail fetch failed: {exc}"
+
+    html = response.text
+    if is_waf_challenge(html):
+        return job, "AWS WAF challenge on detail page"
+
+    try:
+        parse_job_detail_html(html, job)
+    except Exception as exc:  # noqa: BLE001 - keep notifying with search data
+        return job, f"detail parse failed: {exc}"
+
+    return job, None
+
+
+def fetch_page(
+    url: str,
+    cookie_header: Optional[str],
+    timeout: int,
+    referer: Optional[str] = None,
+) -> requests.Response:
     session = requests.Session()
-    session.headers.update(build_headers(referer=url))
+    session.headers.update(build_headers(referer=referer or url))
 
     if cookie_header:
         for name, value in parse_cookie_header(cookie_header).items():
@@ -370,53 +717,96 @@ def split_telegram_messages(text: str, max_length: int = 4000) -> List[str]:
     return chunks
 
 
-def render_telegram_job_html(
-    job: Job,
-    source_url: str,
-    index: Optional[int] = None,
-    total: Optional[int] = None,
-) -> str:
-    title = job.title or ""
-    safe_title = (
-        title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    )
+def _verification_label_icon(label: str) -> str:
+    mapping = {
+        "本人確認": "🆔 : ",
+        "機密保持確認": "🔒 : ",
+        "電話確認": "📞 : ",
+        "ランサーズチェック": "🏅 : ",
+    }
+    return mapping.get(label, "• : ")
 
-    if total is not None and index is not None:
-        header = f"Lancers job update ({index}/{total})"
-    else:
-        header = "Lancers job update"
 
-    lines: List[str] = [f"<b>{header}</b>", f"<i>{source_url}</i>", ""]
-    lines.append(f"<b>{safe_title}</b>")
-    if job.url:
-        lines.append(f"URL: {job.url}")
+def render_telegram_job_html(job: Job) -> str:
+    title = clean_job_title(job.title) or (job.title or "")
+    lines: List[str] = [f"<b>{escape_html(title)}</b>", ""]
+
+    if job.category:
+        lines.append(f"📂 Category: {escape_html(job.category)}")
     if job.budget:
-        lines.append(f"Budget: {job.budget}")
+        lines.append(f"💰 Budget: {escape_html(job.budget)}")
     if job.deadline:
-        lines.append(f"Deadline: {job.deadline}")
-    if job.applicants:
-        lines.append(job.applicants)
-    if job.skills:
-        lines.append(f"Skills: {', '.join(job.skills[:8])}")
+        lines.append(f"⏰ Deadline: {escape_html(job.deadline)}")
 
-    if job.summary:
-        snippet = job.summary.replace("\n", " ").strip()
-        if len(snippet) > 240:
-            snippet = snippet[:237] + "..."
-        safe_summary = (
-            snippet.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
-        lines.append(f"\n<b>Summary</b>\n{safe_summary}")
+    status_bits: List[str] = []
+    if job.proposals_count:
+        status_bits.append(f"📨 {escape_html(job.proposals_count)}")
+    if job.favorites_count:
+        status_bits.append(f"❤️ {escape_html(job.favorites_count)}")
+    if job.views_count:
+        status_bits.append(f"👁 {escape_html(job.views_count)}")
+    if job.in_progress_count:
+        status_bits.append(f"🔄 {escape_html(job.in_progress_count)}")
+    if job.completed_count:
+        status_bits.append(f"✅ {escape_html(job.completed_count)}")
+    if status_bits:
+        lines.append("📊 Status: " + " | ".join(status_bits))
+
+    if job.schedule:
+        schedule_bits = [
+            f"{escape_html(key)} {escape_html(value)}"
+            for key, value in job.schedule.items()
+        ]
+        lines.append("📅 Schedule: " + " / ".join(schedule_bits))
+
+    if job.skills:
+        lines.append(f"🛠 Skills: {escape_html(', '.join(job.skills[:8]))}")
+
+    if job.client_name or job.client_verifications:
+        lines.append("")
+        lines.append("<b>👤 Client</b>")
+        if job.client_name:
+            if job.client_url:
+                lines.append(
+                    f"🧑 Name: <a href=\"{job.client_url}\">"
+                    f"{escape_html(job.client_name)}</a>"
+                )
+            else:
+                lines.append(f"🧑 Name: {escape_html(job.client_name)}")
+        if job.client_verifications:
+            verify_bits = []
+            for label, ok in job.client_verifications.items():
+                icon = _verification_label_icon(label)
+                mark = "✔" if ok else "❌"
+                verify_bits.append(f"{icon}{mark}")
+            lines.append("🛡 Verification: " + " | ".join(verify_bits))
+        rating_bits: List[str] = []
+        if job.client_rating_good is not None:
+            rating_bits.append(f"👍 {escape_html(job.client_rating_good)}")
+        if job.client_rating_bad is not None:
+            rating_bits.append(f"👎 {escape_html(job.client_rating_bad)}")
+        if rating_bits:
+            lines.append("⭐ Rating: " + " / ".join(rating_bits))
+        if job.client_order_rate:
+            order = f"📈 Order rate: {escape_html(job.client_order_rate)}"
+            if job.client_order_counts:
+                order += f" ({escape_html(job.client_order_counts)})"
+            lines.append(order)
+
+    body = job.description or job.summary
+    if body:
+        snippet = body.strip()
+        if len(snippet) > 300:
+            snippet = snippet[:297] + "..."
+        lines.append(f"\n<b>📝 Details</b>\n{escape_html(snippet)}")
 
     return "\n".join(lines).strip()
 
 
 def build_telegram_job_keyboard(job: Job) -> Dict[str, object]:
-    # "Bid" is intentionally non-automated; user must act manually on the job page.
     return {
         "inline_keyboard": [
             [{"text": "View Details", "url": job.url}],
-            [{"text": "Bid", "url": job.url}],
         ]
     }
 
@@ -688,7 +1078,12 @@ def process_watch_target(
     jobs = extract_jobs(html, target.url)
     new_jobs = get_new_jobs(previous_jobs, jobs)
     with open(target.save_json, "w", encoding="utf-8") as fp:
-        json.dump([asdict(job) for job in jobs], fp, ensure_ascii=False, indent=2)
+        json.dump(
+            [job_to_snapshot(job) for job in jobs],
+            fp,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     print(f"HTTP {response.status_code} | final URL: {response.url}")
     print(f"Saved HTML: {target.save_html}")
@@ -725,12 +1120,29 @@ def process_watch_target(
         return
 
     total = len(new_jobs)
+    enriched_jobs: List[Job] = []
+    for idx, job in enumerate(new_jobs, start=1):
+        enriched, detail_error = enrich_job_from_detail(
+            job,
+            cookie,
+            timeout,
+            referer=target.url,
+        )
+        if detail_error:
+            print(
+                f"Detail enrichment skipped for {job.url}: {detail_error}. "
+                "Sending search-list fields only."
+            )
+        else:
+            print(f"Enriched detail for {job.url}")
+        enriched_jobs.append(enriched)
+        if idx < total:
+            time.sleep(0.8)
+
     for chat_id in chat_ids:
         upsert_cached_chat_id(target.chat_cache_file, chat_id)
-        for idx, job in enumerate(new_jobs, start=1):
-            message = render_telegram_job_html(
-                job, target.url, index=idx, total=total
-            )
+        for idx, job in enumerate(enriched_jobs, start=1):
+            message = render_telegram_job_html(job)
             keyboard = build_telegram_job_keyboard(job)
             send_to_telegram(
                 target.telegram_token,
