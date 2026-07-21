@@ -2,7 +2,12 @@
 """
 Fetch Lancers job search results with browser-like HTTP requests.
 
+Monitors LANCERS_URL then optional LANCERS_URL1 sequentially. Each URL gets
+its own HTML/JSON snapshot (lancers_search.html / lancers_jobs.json and
+lancers_search_1.html / lancers_jobs_1.json).
+
 Example:
+  python lancers_fetch.py
   python lancers_fetch.py ^
     --url "https://www.lancers.jp/work/search/system?open=1&ref=header_menu" ^
     --cookie "aws-waf-token=...; ..."
@@ -570,16 +575,189 @@ def get_startup_chat_ids(token: str, cache_file: str, timeout: int) -> List[str]
     return discovered
 
 
+@dataclass
+class WatchTarget:
+    """One Lancers search URL and its dedicated snapshot files."""
+
+    label: str
+    url: str
+    save_html: str
+    save_json: str
+
+
+def collect_watch_targets(
+    env_url: str,
+    env_url1: str,
+    cli_url: Optional[str],
+    save_html: str,
+    save_json: str,
+) -> List[WatchTarget]:
+    """
+    Build the ordered list of URLs to monitor.
+
+    Defaults:
+      LANCERS_URL  -> lancers_search.html  / lancers_jobs.json
+      LANCERS_URL1 -> lancers_search_1.html / lancers_jobs_1.json
+
+    If --url is passed explicitly, only that single URL is monitored (using
+    --save-html / --save-json).
+    """
+    if cli_url is not None:
+        return [
+            WatchTarget(
+                label="1",
+                url=cli_url,
+                save_html=save_html,
+                save_json=save_json,
+            )
+        ]
+
+    targets: List[WatchTarget] = []
+    primary = (env_url or "").strip() or DEFAULT_URL
+    targets.append(
+        WatchTarget(
+            label="1",
+            url=primary,
+            save_html=save_html,
+            save_json=save_json,
+        )
+    )
+
+    secondary = (env_url1 or "").strip()
+    if secondary:
+        # Keep names parallel to the primary snapshot files.
+        html_path = save_html
+        json_path = save_json
+        if html_path.endswith(".html"):
+            html_path = html_path[:-5] + "_1.html"
+        else:
+            html_path = html_path + "_1"
+        if json_path.endswith(".json"):
+            json_path = json_path[:-5] + "_1.json"
+        else:
+            json_path = json_path + "_1"
+        targets.append(
+            WatchTarget(
+                label="2",
+                url=secondary,
+                save_html=html_path,
+                save_json=json_path,
+            )
+        )
+
+    return targets
+
+
+def process_watch_target(
+    target: WatchTarget,
+    cookie: Optional[str],
+    timeout: int,
+    telegram_token: str,
+    chat_cache_file: str,
+    chat_ids: Optional[List[str]],
+) -> Optional[List[str]]:
+    """
+    Fetch, parse, diff, and notify for one search URL.
+
+    Returns the resolved chat_ids (possibly discovered/cached) so later
+    targets can reuse them without another getUpdates round-trip.
+    """
+    print(f"\n=== Watch target {target.label}: {target.url} ===")
+
+    response = fetch_page(target.url, cookie, timeout)
+    html = response.text
+
+    with open(target.save_html, "w", encoding="utf-8") as fp:
+        fp.write(html)
+
+    if is_waf_challenge(html):
+        raise SystemExit(
+            f"AWS WAF challenge page received for target {target.label} "
+            f"({target.url}). Refresh Lancers in Chrome, pass the captcha if "
+            "shown, then copy a fresh Cookie header (must include "
+            "aws-waf-token) into LANCERS_COOKIE."
+        )
+
+    previous_jobs = load_existing_jobs(target.save_json)
+    jobs = extract_jobs(html, target.url)
+    new_jobs = get_new_jobs(previous_jobs, jobs)
+    with open(target.save_json, "w", encoding="utf-8") as fp:
+        json.dump([asdict(job) for job in jobs], fp, ensure_ascii=False, indent=2)
+
+    print(f"HTTP {response.status_code} | final URL: {response.url}")
+    print(f"Saved HTML: {target.save_html}")
+    print(f"Parsed jobs: {len(jobs)}")
+    print(f"New jobs: {len(new_jobs)}")
+    print(f"Saved JSON: {target.save_json}")
+
+    if not jobs:
+        print(
+            "Warning: 0 jobs parsed. HTML was saved — selectors may need updating, "
+            "or the cookie may not include a valid logged-in / WAF session."
+        )
+
+    if not new_jobs:
+        print("No new jobs detected. Telegram send skipped for this target.")
+        return chat_ids
+
+    if not telegram_token:
+        print("Telegram send skipped. TELEGRAM_BOT_TOKEN is not set.")
+        return chat_ids
+
+    if chat_ids is None:
+        chat_ids = get_startup_chat_ids(telegram_token, chat_cache_file, timeout)
+
+    if not chat_ids:
+        print(
+            "No Telegram target chat found yet. Open your bot and press Start once, "
+            "then run the script again for automatic delivery."
+        )
+        return chat_ids
+
+    total = len(new_jobs)
+    for chat_id in chat_ids:
+        upsert_cached_chat_id(chat_cache_file, chat_id)
+        for idx, job in enumerate(new_jobs, start=1):
+            message = render_telegram_job_html(
+                job, target.url, index=idx, total=total
+            )
+            keyboard = build_telegram_job_keyboard(job)
+            send_to_telegram(
+                telegram_token,
+                chat_id,
+                message,
+                timeout,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+    print(
+        f"Auto-sent {total} new job message(s) per chat to {len(chat_ids)} chat(s): "
+        f"{', '.join(chat_ids)}"
+    )
+    return chat_ids
+
+
 def main() -> None:
     load_dotenv()
     env_url = os.getenv("LANCERS_URL", DEFAULT_URL)
+    env_url1 = os.getenv("LANCERS_URL1", "")
     env_cookie = os.getenv("LANCERS_COOKIE", "")
     env_telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
     parser = argparse.ArgumentParser(
-        description="Fetch Lancers search result page like browser."
+        description=(
+            "Fetch Lancers search result pages like a browser. "
+            "Monitors LANCERS_URL then LANCERS_URL1 sequentially when both are set."
+        )
     )
-    parser.add_argument("--url", default=env_url, help="Target search URL")
+    parser.add_argument(
+        "--url",
+        default=None,
+        help=(
+            "Monitor only this single search URL (skips LANCERS_URL1). "
+            "Default: use LANCERS_URL and optional LANCERS_URL1 from .env"
+        ),
+    )
     parser.add_argument(
         "--cookie",
         default=env_cookie,
@@ -591,12 +769,18 @@ def main() -> None:
     parser.add_argument(
         "--save-html",
         default="lancers_search.html",
-        help="Path to save fetched HTML",
+        help=(
+            "Path to save fetched HTML for the first URL "
+            "(second URL uses a parallel *_1.html name)"
+        ),
     )
     parser.add_argument(
         "--save-json",
         default="lancers_jobs.json",
-        help="Path to save parsed jobs as JSON",
+        help=(
+            "Path to save parsed jobs JSON for the first URL "
+            "(second URL uses a parallel *_1.json name)"
+        ),
     )
     parser.add_argument(
         "--telegram-token",
@@ -622,71 +806,25 @@ def main() -> None:
             "Request Headers → Cookie), paste it into .env, then retry."
         )
 
-    response = fetch_page(args.url, args.cookie or None, args.timeout)
-    html = response.text
-
-    with open(args.save_html, "w", encoding="utf-8") as fp:
-        fp.write(html)
-
-    if is_waf_challenge(html):
-        raise SystemExit(
-            "AWS WAF challenge page received instead of job listings. "
-            "Refresh Lancers in Chrome, pass the captcha if shown, then copy a "
-            "fresh Cookie header (must include aws-waf-token) into LANCERS_COOKIE."
-        )
-
-    previous_jobs = load_existing_jobs(args.save_json)
-    jobs = extract_jobs(html, args.url)
-    new_jobs = get_new_jobs(previous_jobs, jobs)
-    with open(args.save_json, "w", encoding="utf-8") as fp:
-        json.dump([asdict(job) for job in jobs], fp, ensure_ascii=False, indent=2)
-
-    print(f"HTTP {response.status_code} | final URL: {response.url}")
-    print(f"Saved HTML: {args.save_html}")
-    print(f"Parsed jobs: {len(jobs)}")
-    print(f"New jobs: {len(new_jobs)}")
-    print(f"Saved JSON: {args.save_json}")
-
-    if not jobs:
-        print(
-            "Warning: 0 jobs parsed. HTML was saved — selectors may need updating, "
-            "or the cookie may not include a valid logged-in / WAF session."
-        )
-
-    if not new_jobs:
-        print("No new jobs detected. Telegram send skipped.")
-        return
-
-    if not args.telegram_token:
-        print("Telegram send skipped. TELEGRAM_BOT_TOKEN is not set.")
-        return
-
-    chat_ids = get_startup_chat_ids(args.telegram_token, args.chat_cache_file, args.timeout)
-    if not chat_ids:
-        print(
-            "No Telegram target chat found yet. Open your bot and press Start once, "
-            "then run the script again for automatic delivery."
-        )
-        return
-
-    total = len(new_jobs)
-    for chat_id in chat_ids:
-        upsert_cached_chat_id(args.chat_cache_file, chat_id)
-        for idx, job in enumerate(new_jobs, start=1):
-            message = render_telegram_job_html(job, args.url, index=idx, total=total)
-            keyboard = build_telegram_job_keyboard(job)
-            send_to_telegram(
-                args.telegram_token,
-                chat_id,
-                message,
-                args.timeout,
-                reply_markup=keyboard,
-                parse_mode="HTML",
-            )
-    print(
-        f"Auto-sent {total} new job message(s) per chat to {len(chat_ids)} chat(s): "
-        f"{', '.join(chat_ids)}"
+    targets = collect_watch_targets(
+        env_url=env_url,
+        env_url1=env_url1,
+        cli_url=args.url,
+        save_html=args.save_html,
+        save_json=args.save_json,
     )
+    print(f"Monitoring {len(targets)} search URL(s) sequentially.")
+
+    chat_ids: Optional[List[str]] = None
+    for target in targets:
+        chat_ids = process_watch_target(
+            target=target,
+            cookie=args.cookie or None,
+            timeout=args.timeout,
+            telegram_token=args.telegram_token,
+            chat_cache_file=args.chat_cache_file,
+            chat_ids=chat_ids,
+        )
 
 
 if __name__ == "__main__":
