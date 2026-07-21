@@ -3,8 +3,12 @@
 Fetch Lancers job search results with browser-like HTTP requests.
 
 Monitors LANCERS_URL then optional LANCERS_URL1 sequentially. Each URL gets
-its own HTML/JSON snapshot (lancers_search.html / lancers_jobs.json and
-lancers_search_1.html / lancers_jobs_1.json).
+its own HTML/JSON snapshot and Telegram bot:
+
+  LANCERS_URL  + TELEGRAM_BOT_TOKEN
+    -> lancers_search.html / lancers_jobs.json / telegram_chat_ids.json
+  LANCERS_URL1 + TELEGRAM_BOT_TOKEN1
+    -> lancers_search_1.html / lancers_jobs_1.json / telegram_chat_ids_1.json
 
 Example:
   python lancers_fetch.py
@@ -577,12 +581,22 @@ def get_startup_chat_ids(token: str, cache_file: str, timeout: int) -> List[str]
 
 @dataclass
 class WatchTarget:
-    """One Lancers search URL and its dedicated snapshot files."""
+    """One Lancers search URL with dedicated snapshot files and Telegram bot."""
 
     label: str
     url: str
     save_html: str
     save_json: str
+    telegram_token: str
+    chat_cache_file: str
+
+
+def _parallel_path(path: str, suffix: str = "_1") -> str:
+    """Insert a suffix before the file extension (e.g. a.json -> a_1.json)."""
+    for ext in (".html", ".json"):
+        if path.endswith(ext):
+            return path[: -len(ext)] + suffix + ext
+    return path + suffix
 
 
 def collect_watch_targets(
@@ -591,16 +605,21 @@ def collect_watch_targets(
     cli_url: Optional[str],
     save_html: str,
     save_json: str,
+    telegram_token: str,
+    telegram_token1: str,
+    chat_cache_file: str,
 ) -> List[WatchTarget]:
     """
     Build the ordered list of URLs to monitor.
 
     Defaults:
-      LANCERS_URL  -> lancers_search.html  / lancers_jobs.json
-      LANCERS_URL1 -> lancers_search_1.html / lancers_jobs_1.json
+      LANCERS_URL  + TELEGRAM_BOT_TOKEN
+        -> lancers_search.html / lancers_jobs.json / telegram_chat_ids.json
+      LANCERS_URL1 + TELEGRAM_BOT_TOKEN1
+        -> lancers_search_1.html / lancers_jobs_1.json / telegram_chat_ids_1.json
 
     If --url is passed explicitly, only that single URL is monitored (using
-    --save-html / --save-json).
+    the primary token and --save-html / --save-json / --chat-cache-file).
     """
     if cli_url is not None:
         return [
@@ -609,6 +628,8 @@ def collect_watch_targets(
                 url=cli_url,
                 save_html=save_html,
                 save_json=save_json,
+                telegram_token=telegram_token,
+                chat_cache_file=chat_cache_file,
             )
         ]
 
@@ -620,28 +641,21 @@ def collect_watch_targets(
             url=primary,
             save_html=save_html,
             save_json=save_json,
+            telegram_token=(telegram_token or "").strip(),
+            chat_cache_file=chat_cache_file,
         )
     )
 
     secondary = (env_url1 or "").strip()
     if secondary:
-        # Keep names parallel to the primary snapshot files.
-        html_path = save_html
-        json_path = save_json
-        if html_path.endswith(".html"):
-            html_path = html_path[:-5] + "_1.html"
-        else:
-            html_path = html_path + "_1"
-        if json_path.endswith(".json"):
-            json_path = json_path[:-5] + "_1.json"
-        else:
-            json_path = json_path + "_1"
         targets.append(
             WatchTarget(
                 label="2",
                 url=secondary,
-                save_html=html_path,
-                save_json=json_path,
+                save_html=_parallel_path(save_html),
+                save_json=_parallel_path(save_json),
+                telegram_token=(telegram_token1 or "").strip(),
+                chat_cache_file=_parallel_path(chat_cache_file),
             )
         )
 
@@ -652,16 +666,8 @@ def process_watch_target(
     target: WatchTarget,
     cookie: Optional[str],
     timeout: int,
-    telegram_token: str,
-    chat_cache_file: str,
-    chat_ids: Optional[List[str]],
-) -> Optional[List[str]]:
-    """
-    Fetch, parse, diff, and notify for one search URL.
-
-    Returns the resolved chat_ids (possibly discovered/cached) so later
-    targets can reuse them without another getUpdates round-trip.
-    """
+) -> None:
+    """Fetch, parse, diff, and notify for one search URL on its own bot."""
     print(f"\n=== Watch target {target.label}: {target.url} ===")
 
     response = fetch_page(target.url, cookie, timeout)
@@ -698,32 +704,36 @@ def process_watch_target(
 
     if not new_jobs:
         print("No new jobs detected. Telegram send skipped for this target.")
-        return chat_ids
+        return
 
-    if not telegram_token:
-        print("Telegram send skipped. TELEGRAM_BOT_TOKEN is not set.")
-        return chat_ids
+    token_env = (
+        "TELEGRAM_BOT_TOKEN" if target.label == "1" else "TELEGRAM_BOT_TOKEN1"
+    )
+    if not target.telegram_token:
+        print(f"Telegram send skipped. {token_env} is not set.")
+        return
 
-    if chat_ids is None:
-        chat_ids = get_startup_chat_ids(telegram_token, chat_cache_file, timeout)
-
+    chat_ids = get_startup_chat_ids(
+        target.telegram_token, target.chat_cache_file, timeout
+    )
     if not chat_ids:
         print(
-            "No Telegram target chat found yet. Open your bot and press Start once, "
-            "then run the script again for automatic delivery."
+            f"No Telegram target chat found yet for bot {target.label}. "
+            "Open that bot and press Start once, then run the script again "
+            "for automatic delivery."
         )
-        return chat_ids
+        return
 
     total = len(new_jobs)
     for chat_id in chat_ids:
-        upsert_cached_chat_id(chat_cache_file, chat_id)
+        upsert_cached_chat_id(target.chat_cache_file, chat_id)
         for idx, job in enumerate(new_jobs, start=1):
             message = render_telegram_job_html(
                 job, target.url, index=idx, total=total
             )
             keyboard = build_telegram_job_keyboard(job)
             send_to_telegram(
-                telegram_token,
+                target.telegram_token,
                 chat_id,
                 message,
                 timeout,
@@ -731,10 +741,10 @@ def process_watch_target(
                 parse_mode="HTML",
             )
     print(
-        f"Auto-sent {total} new job message(s) per chat to {len(chat_ids)} chat(s): "
-        f"{', '.join(chat_ids)}"
+        f"Auto-sent {total} new job message(s) via bot {target.label} "
+        f"to {len(chat_ids)} chat(s): {', '.join(chat_ids)} "
+        f"(cache: {target.chat_cache_file})"
     )
-    return chat_ids
 
 
 def main() -> None:
@@ -743,11 +753,13 @@ def main() -> None:
     env_url1 = os.getenv("LANCERS_URL1", "")
     env_cookie = os.getenv("LANCERS_COOKIE", "")
     env_telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    env_telegram_token1 = os.getenv("TELEGRAM_BOT_TOKEN1", "")
 
     parser = argparse.ArgumentParser(
         description=(
             "Fetch Lancers search result pages like a browser. "
-            "Monitors LANCERS_URL then LANCERS_URL1 sequentially when both are set."
+            "Monitors LANCERS_URL (TELEGRAM_BOT_TOKEN) then LANCERS_URL1 "
+            "(TELEGRAM_BOT_TOKEN1) sequentially when both are set."
         )
     )
     parser.add_argument(
@@ -785,7 +797,12 @@ def main() -> None:
     parser.add_argument(
         "--telegram-token",
         default=env_telegram_token,
-        help="Telegram bot token (or TELEGRAM_BOT_TOKEN in .env)",
+        help="Telegram bot token for URL 1 (or TELEGRAM_BOT_TOKEN in .env)",
+    )
+    parser.add_argument(
+        "--telegram-token1",
+        default=env_telegram_token1,
+        help="Telegram bot token for URL 2 (or TELEGRAM_BOT_TOKEN1 in .env)",
     )
     parser.add_argument(
         "--bot-mode",
@@ -795,7 +812,9 @@ def main() -> None:
     parser.add_argument(
         "--chat-cache-file",
         default=DEFAULT_CHAT_CACHE_FILE,
-        help="Path to cache Telegram chat IDs for automatic startup push.",
+        help=(
+            "Chat ID cache for bot 1 (second bot uses a parallel *_1.json name)"
+        ),
     )
     args = parser.parse_args()
 
@@ -812,18 +831,17 @@ def main() -> None:
         cli_url=args.url,
         save_html=args.save_html,
         save_json=args.save_json,
+        telegram_token=args.telegram_token,
+        telegram_token1=args.telegram_token1,
+        chat_cache_file=args.chat_cache_file,
     )
-    print(f"Monitoring {len(targets)} search URL(s) sequentially.")
+    print(f"Monitoring {len(targets)} search URL(s) sequentially (one bot each).")
 
-    chat_ids: Optional[List[str]] = None
     for target in targets:
-        chat_ids = process_watch_target(
+        process_watch_target(
             target=target,
             cookie=args.cookie or None,
             timeout=args.timeout,
-            telegram_token=args.telegram_token,
-            chat_cache_file=args.chat_cache_file,
-            chat_ids=chat_ids,
         )
 
 
