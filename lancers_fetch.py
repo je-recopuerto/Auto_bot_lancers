@@ -2,8 +2,9 @@
 """
 Fetch Lancers job search results with browser-like HTTP requests.
 
-Monitors LANCERS_URL then optional LANCERS_URL1 sequentially. Each URL gets
-its own HTML/JSON snapshot and Telegram bot:
+Monitors LANCERS_URL then optional LANCERS_URL1 sequentially in a continuous
+loop (real-time job watch). Each URL gets its own HTML/JSON snapshot and
+Telegram bot:
 
   LANCERS_URL  + TELEGRAM_BOT_TOKEN
     -> lancers_search.html / lancers_jobs.json / telegram_chat_ids.json
@@ -16,9 +17,8 @@ fuller job description — not only search-list fields.
 
 Example:
   python lancers_fetch.py
-  python lancers_fetch.py ^
-    --url "https://www.lancers.jp/work/search/system?open=1&ref=header_menu" ^
-    --cookie "aws-waf-token=...; ..."
+  python lancers_fetch.py --once
+  python lancers_fetch.py --interval 120
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ DEFAULT_URL = (
     "https://www.lancers.jp/work/search/system?open=1&ref=header_menu"
 )
 DEFAULT_CHAT_CACHE_FILE = "telegram_chat_ids.json"
+DEFAULT_POLL_INTERVAL_SEC = 60
 DETAIL_HREF_RE = re.compile(r"/work/detail/(\d+)")
 BUDGET_RE = re.compile(
     r"(?:プロジェクト|コンペ|タスク|時間単価)?\s*"
@@ -210,6 +211,10 @@ def is_waf_challenge(page_html: str) -> bool:
         "AwsWafIntegration",
     )
     return any(marker in page_html for marker in markers)
+
+
+class WafChallengeError(RuntimeError):
+    """Raised when Lancers returns an AWS WAF challenge page."""
 
 
 def extract_budget(text: str) -> Optional[str]:
@@ -1067,7 +1072,7 @@ def process_watch_target(
         fp.write(html)
 
     if is_waf_challenge(html):
-        raise SystemExit(
+        raise WafChallengeError(
             f"AWS WAF challenge page received for target {target.label} "
             f"({target.url}). Refresh Lancers in Chrome, pass the captcha if "
             "shown, then copy a fresh Cookie header (must include "
@@ -1161,17 +1166,13 @@ def process_watch_target(
 
 def main() -> None:
     load_dotenv()
-    env_url = os.getenv("LANCERS_URL", DEFAULT_URL)
-    env_url1 = os.getenv("LANCERS_URL1", "")
-    env_cookie = os.getenv("LANCERS_COOKIE", "")
-    env_telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    env_telegram_token1 = os.getenv("TELEGRAM_BOT_TOKEN1", "")
+    env_poll = os.getenv("POLL_INTERVAL", str(DEFAULT_POLL_INTERVAL_SEC))
 
     parser = argparse.ArgumentParser(
         description=(
-            "Fetch Lancers search result pages like a browser. "
-            "Monitors LANCERS_URL (TELEGRAM_BOT_TOKEN) then LANCERS_URL1 "
-            "(TELEGRAM_BOT_TOKEN1) sequentially when both are set."
+            "Continuously monitor Lancers search pages and push new jobs to "
+            "Telegram. Monitors LANCERS_URL (TELEGRAM_BOT_TOKEN) then "
+            "LANCERS_URL1 (TELEGRAM_BOT_TOKEN1) each cycle."
         )
     )
     parser.add_argument(
@@ -1184,8 +1185,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--cookie",
-        default=env_cookie,
-        help="Raw Cookie header value copied from browser DevTools (or .env)",
+        default=None,
+        help=(
+            "Raw Cookie header value. Default: LANCERS_COOKIE from .env "
+            "(reloaded every cycle)"
+        ),
     )
     parser.add_argument(
         "--timeout", type=int, default=30, help="Request timeout (seconds)"
@@ -1208,18 +1212,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--telegram-token",
-        default=env_telegram_token,
-        help="Telegram bot token for URL 1 (or TELEGRAM_BOT_TOKEN in .env)",
+        default=None,
+        help="Telegram bot token for URL 1 (default: TELEGRAM_BOT_TOKEN in .env)",
     )
     parser.add_argument(
         "--telegram-token1",
-        default=env_telegram_token1,
-        help="Telegram bot token for URL 2 (or TELEGRAM_BOT_TOKEN1 in .env)",
-    )
-    parser.add_argument(
-        "--bot-mode",
-        action="store_true",
-        help=argparse.SUPPRESS,
+        default=None,
+        help="Telegram bot token for URL 2 (default: TELEGRAM_BOT_TOKEN1 in .env)",
     )
     parser.add_argument(
         "--chat-cache-file",
@@ -1228,33 +1227,118 @@ def main() -> None:
             "Chat ID cache for bot 1 (second bot uses a parallel *_1.json name)"
         ),
     )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=None,
+        help=(
+            f"Seconds to wait between monitor cycles "
+            f"(default: POLL_INTERVAL or {DEFAULT_POLL_INTERVAL_SEC})"
+        ),
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single monitor cycle and exit (disable continuous mode)",
+    )
     args = parser.parse_args()
 
-    if not (args.cookie or "").strip():
-        raise SystemExit(
-            "LANCERS_COOKIE is required. Lancers uses AWS WAF — copy the full "
-            "Cookie header from Chrome DevTools (Network → document request → "
-            "Request Headers → Cookie), paste it into .env, then retry."
+    try:
+        poll_interval = (
+            args.interval
+            if args.interval is not None
+            else int(str(env_poll).strip() or DEFAULT_POLL_INTERVAL_SEC)
         )
+    except ValueError:
+        poll_interval = DEFAULT_POLL_INTERVAL_SEC
+    if poll_interval < 1:
+        poll_interval = DEFAULT_POLL_INTERVAL_SEC
 
-    targets = collect_watch_targets(
-        env_url=env_url,
-        env_url1=env_url1,
-        cli_url=args.url,
-        save_html=args.save_html,
-        save_json=args.save_json,
-        telegram_token=args.telegram_token,
-        telegram_token1=args.telegram_token1,
-        chat_cache_file=args.chat_cache_file,
+    mode = "once" if args.once else "continuous"
+    print(
+        f"Lancers monitor starting ({mode}). "
+        f"Poll interval: {poll_interval}s. Ctrl+C to stop."
     )
-    print(f"Monitoring {len(targets)} search URL(s) sequentially (one bot each).")
 
-    for target in targets:
-        process_watch_target(
-            target=target,
-            cookie=args.cookie or None,
-            timeout=args.timeout,
-        )
+    cycle = 0
+    try:
+        while True:
+            cycle += 1
+            load_dotenv(override=True)
+
+            cookie = (args.cookie if args.cookie is not None else os.getenv("LANCERS_COOKIE", "")).strip()
+            if cookie.startswith('"') and cookie.endswith('"'):
+                cookie = cookie[1:-1].strip()
+
+            if not cookie:
+                print(
+                    "LANCERS_COOKIE is missing. Waiting for .env update before "
+                    f"retrying in {poll_interval}s..."
+                )
+                if args.once:
+                    raise SystemExit(
+                        "LANCERS_COOKIE is required. Lancers uses AWS WAF — copy "
+                        "the full Cookie header from Chrome DevTools into .env."
+                    )
+                time.sleep(poll_interval)
+                continue
+
+            targets = collect_watch_targets(
+                env_url=os.getenv("LANCERS_URL", DEFAULT_URL),
+                env_url1=os.getenv("LANCERS_URL1", ""),
+                cli_url=args.url,
+                save_html=args.save_html,
+                save_json=args.save_json,
+                telegram_token=(
+                    args.telegram_token
+                    if args.telegram_token is not None
+                    else os.getenv("TELEGRAM_BOT_TOKEN", "")
+                ),
+                telegram_token1=(
+                    args.telegram_token1
+                    if args.telegram_token1 is not None
+                    else os.getenv("TELEGRAM_BOT_TOKEN1", "")
+                ),
+                chat_cache_file=args.chat_cache_file,
+            )
+
+            print(
+                f"\n======== Cycle {cycle} | "
+                f"monitoring {len(targets)} URL(s) ========"
+            )
+
+            waf_hit = False
+            for target in targets:
+                try:
+                    process_watch_target(
+                        target=target,
+                        cookie=cookie or None,
+                        timeout=args.timeout,
+                    )
+                except WafChallengeError as exc:
+                    print(f"WAF challenge: {exc}")
+                    print(
+                        "Update LANCERS_COOKIE in .env after refreshing the "
+                        f"browser session. Retrying in {poll_interval}s..."
+                    )
+                    waf_hit = True
+                    break
+                except requests.RequestException as exc:
+                    print(
+                        f"Request error on target {target.label}: {exc}. "
+                        "Continuing with remaining targets."
+                    )
+
+            if args.once:
+                break
+
+            wait_for = poll_interval
+            if waf_hit:
+                wait_for = max(poll_interval, 120)
+            print(f"\nCycle {cycle} done. Next check in {wait_for}s...")
+            time.sleep(wait_for)
+    except KeyboardInterrupt:
+        print("\nStopped by user. Exiting.")
 
 
 if __name__ == "__main__":
