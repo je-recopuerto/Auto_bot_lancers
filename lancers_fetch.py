@@ -42,6 +42,10 @@ DEFAULT_URL = (
 )
 DEFAULT_CHAT_CACHE_FILE = "telegram_chat_ids.json"
 DEFAULT_POLL_INTERVAL_SEC = 60
+# Only the top N search results are compared/stored. Lancers page size can
+# flicker (e.g. 12 vs 13); limiting avoids re-notifying jobs that drop off
+# the unstable bottom of the list and reappear later.
+JOB_COMPARE_LIMIT = 10
 DETAIL_HREF_RE = re.compile(r"/work/detail/(\d+)")
 BUDGET_RE = re.compile(
     r"(?:プロジェクト|コンペ|タスク|時間単価)?\s*"
@@ -1080,7 +1084,8 @@ def process_watch_target(
         )
 
     previous_jobs = load_existing_jobs(target.save_json)
-    jobs = extract_jobs(html, target.url)
+    parsed_jobs = extract_jobs(html, target.url)
+    jobs = parsed_jobs[:JOB_COMPARE_LIMIT]
     new_jobs = get_new_jobs(previous_jobs, jobs)
     with open(target.save_json, "w", encoding="utf-8") as fp:
         json.dump(
@@ -1092,7 +1097,10 @@ def process_watch_target(
 
     print(f"HTTP {response.status_code} | final URL: {response.url}")
     print(f"Saved HTML: {target.save_html}")
-    print(f"Parsed jobs: {len(jobs)}")
+    print(
+        f"Parsed jobs: {len(parsed_jobs)} "
+        f"(using top {len(jobs)} for compare/store)"
+    )
     print(f"New jobs: {len(new_jobs)}")
     print(f"Saved JSON: {target.save_json}")
 
