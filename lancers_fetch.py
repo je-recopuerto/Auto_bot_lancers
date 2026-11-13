@@ -3,13 +3,14 @@
 Fetch Lancers job search results with browser-like HTTP requests.
 
 Monitors LANCERS_URL then optional LANCERS_URL1 sequentially in a continuous
-loop (real-time job watch). Each URL gets its own HTML/JSON snapshot and
-Telegram bot:
+loop (real-time job watch). Seen job URLs are stored permanently in MongoDB
+(lancers.post) so reappearing listings are not treated as new.
 
   LANCERS_URL  + TELEGRAM_BOT_TOKEN
-    -> lancers_search.html / lancers_jobs.json / telegram_chat_ids.json
+    -> HTML dump + Telegram bot 1
   LANCERS_URL1 + TELEGRAM_BOT_TOKEN1
-    -> lancers_search_1.html / lancers_jobs_1.json / telegram_chat_ids_1.json
+    -> HTML dump + Telegram bot 2
+  Shared MongoDB: MONGODB_DB / MONGODB_COLLECTION (default lancers / post)
 
 When new jobs are detected, each job detail page is fetched and parsed so
 Telegram messages include client verification, ratings, schedule, and the
@@ -29,12 +30,16 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from pymongo import ASCENDING, MongoClient
+from pymongo.collection import Collection
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 
 DEFAULT_URL = (
@@ -42,9 +47,8 @@ DEFAULT_URL = (
 )
 DEFAULT_CHAT_CACHE_FILE = "telegram_chat_ids.json"
 DEFAULT_POLL_INTERVAL_SEC = 60
-# Only the top N search results are compared/stored. Lancers page size can
-# flicker (e.g. 12 vs 13); limiting avoids re-notifying jobs that drop off
-# the unstable bottom of the list and reappear later.
+# Only the top N search results are checked each cycle. Lifetime dedupe is
+# handled by MongoDB (unique url), so reappearing older jobs stay suppressed.
 JOB_COMPARE_LIMIT = 10
 DETAIL_HREF_RE = re.compile(r"/work/detail/(\d+)")
 BUDGET_RE = re.compile(
@@ -646,6 +650,19 @@ def parse_job_detail_html(page_html: str, job: Job) -> Job:
     return job
 
 
+def detail_url_for_lancer(url: str) -> str:
+    """
+    Force the lancer-facing detail page.
+
+    Bare /work/detail/{id} can return a public/client summary without the
+    client sidebar. purpose=lancer loads the full posting used for enrichment.
+    """
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["purpose"] = "lancer"
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
 def enrich_job_from_detail(
     job: Job,
     cookie_header: Optional[str],
@@ -661,9 +678,10 @@ def enrich_job_from_detail(
     if not job.url:
         return job, "missing job URL"
 
+    detail_url = detail_url_for_lancer(job.url)
     try:
         response = fetch_page(
-            job.url, cookie_header, timeout, referer=referer or job.url
+            detail_url, cookie_header, timeout, referer=referer or job.url
         )
     except requests.RequestException as exc:
         return job, f"detail fetch failed: {exc}"
@@ -671,6 +689,10 @@ def enrich_job_from_detail(
     html = response.text
     if is_waf_challenge(html):
         return job, "AWS WAF challenge on detail page"
+
+    # Logged-out / wrong-purpose pages lack the client box; treat as soft failure.
+    if "p-work-detail-client-box" not in html and "p-work-detail-lancer" not in html:
+        return job, "detail page missing lancer layout (try refreshing LANCERS_COOKIE)"
 
     try:
         parse_job_detail_html(html, job)
@@ -850,37 +872,118 @@ def send_to_telegram(
     return sent
 
 
-def load_existing_jobs(path: str) -> List[Job]:
-    if not os.path.exists(path):
+def get_mongo_collection(
+    uri: str,
+    db_name: str,
+    collection_name: str,
+) -> Collection:
+    client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+    # Fail fast if MongoDB is unreachable.
+    client.admin.command("ping")
+    collection = client[db_name][collection_name]
+    collection.create_index([("url", ASCENDING)], unique=True)
+    return collection
+
+
+def filter_new_jobs(collection: Collection, jobs: List[Job]) -> List[Job]:
+    """Return jobs whose detail URL is not yet stored in MongoDB."""
+    urls = [job.url for job in jobs if job.url]
+    if not urls:
         return []
-    try:
-        with open(path, "r", encoding="utf-8") as fp:
-            payload = json.load(fp)
+    existing = {
+        doc["url"]
+        for doc in collection.find({"url": {"$in": urls}}, {"url": 1, "_id": 0})
+    }
+    return [job for job in jobs if job.url and job.url not in existing]
+
+
+def job_to_mongo_doc(
+    job: Job,
+    *,
+    source_label: str,
+    source_search_url: str,
+) -> Dict[str, object]:
+    doc = job_to_snapshot(job)
+    doc["source_label"] = source_label
+    doc["source_search_url"] = source_search_url
+    doc["created_at"] = datetime.now(timezone.utc)
+    return doc
+
+
+def insert_new_jobs(
+    collection: Collection,
+    jobs: List[Job],
+    *,
+    source_label: str,
+    source_search_url: str,
+) -> int:
+    """Insert jobs by unique URL. Returns number of documents inserted."""
+    inserted = 0
+    for job in jobs:
+        if not job.url:
+            continue
+        try:
+            collection.insert_one(
+                job_to_mongo_doc(
+                    job,
+                    source_label=source_label,
+                    source_search_url=source_search_url,
+                )
+            )
+            inserted += 1
+        except DuplicateKeyError:
+            continue
+    return inserted
+
+
+def seed_mongo_from_json_files(
+    collection: Collection,
+    json_paths: List[str],
+) -> int:
+    """
+    One-time helper: if the collection is empty, import URLs from legacy
+    JSON snapshot files so the first MongoDB run does not re-alert everything.
+    """
+    if collection.estimated_document_count() > 0:
+        return 0
+
+    inserted = 0
+    for path in json_paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            continue
         if not isinstance(payload, list):
-            return []
-        jobs: List[Job] = []
+            continue
         for row in payload:
             if not isinstance(row, dict):
                 continue
-            jobs.append(
-                Job(
-                    title=str(row.get("title", "")),
-                    url=str(row.get("url", "")),
-                    budget=row.get("budget"),
-                    applicants=row.get("applicants"),
-                    deadline=row.get("deadline"),
-                    summary=row.get("summary"),
-                    skills=row.get("skills") if isinstance(row.get("skills"), list) else [],
-                )
-            )
-        return jobs
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return []
-
-
-def get_new_jobs(previous_jobs: List[Job], latest_jobs: List[Job]) -> List[Job]:
-    existing_urls = {job.url for job in previous_jobs if job.url}
-    return [job for job in latest_jobs if job.url and job.url not in existing_urls]
+            url = str(row.get("url", "")).strip()
+            if not url:
+                continue
+            doc = {
+                "title": str(row.get("title", "")),
+                "url": url,
+                "budget": row.get("budget"),
+                "applicants": row.get("applicants"),
+                "deadline": row.get("deadline"),
+                "summary": row.get("summary"),
+                "skills": row.get("skills")
+                if isinstance(row.get("skills"), list)
+                else [],
+                "source_label": "seed",
+                "source_search_url": "",
+                "created_at": datetime.now(timezone.utc),
+            }
+            try:
+                collection.insert_one(doc)
+                inserted += 1
+            except DuplicateKeyError:
+                continue
+    return inserted
 
 
 def load_cached_chat_ids(path: str) -> List[str]:
@@ -1065,8 +1168,9 @@ def process_watch_target(
     target: WatchTarget,
     cookie: Optional[str],
     timeout: int,
+    posts: Collection,
 ) -> None:
-    """Fetch, parse, diff, and notify for one search URL on its own bot."""
+    """Fetch, parse, diff against MongoDB, and notify for one search URL."""
     print(f"\n=== Watch target {target.label}: {target.url} ===")
 
     response = fetch_page(target.url, cookie, timeout)
@@ -1083,26 +1187,23 @@ def process_watch_target(
             "aws-waf-token) into LANCERS_COOKIE."
         )
 
-    previous_jobs = load_existing_jobs(target.save_json)
     parsed_jobs = extract_jobs(html, target.url)
     jobs = parsed_jobs[:JOB_COMPARE_LIMIT]
-    new_jobs = get_new_jobs(previous_jobs, jobs)
-    with open(target.save_json, "w", encoding="utf-8") as fp:
-        json.dump(
-            [job_to_snapshot(job) for job in jobs],
-            fp,
-            ensure_ascii=False,
-            indent=2,
-        )
+    new_jobs = filter_new_jobs(posts, jobs)
+    saved = insert_new_jobs(
+        posts,
+        new_jobs,
+        source_label=target.label,
+        source_search_url=target.url,
+    )
 
     print(f"HTTP {response.status_code} | final URL: {response.url}")
     print(f"Saved HTML: {target.save_html}")
     print(
         f"Parsed jobs: {len(parsed_jobs)} "
-        f"(using top {len(jobs)} for compare/store)"
+        f"(checking top {len(jobs)} against MongoDB)"
     )
-    print(f"New jobs: {len(new_jobs)}")
-    print(f"Saved JSON: {target.save_json}")
+    print(f"New jobs: {len(new_jobs)} (inserted {saved})")
 
     if not jobs:
         print(
@@ -1154,7 +1255,7 @@ def process_watch_target(
 
     for chat_id in chat_ids:
         upsert_cached_chat_id(target.chat_cache_file, chat_id)
-        for idx, job in enumerate(enriched_jobs, start=1):
+        for job in enriched_jobs:
             message = render_telegram_job_html(job)
             keyboard = build_telegram_job_keyboard(job)
             send_to_telegram(
@@ -1214,8 +1315,8 @@ def main() -> None:
         "--save-json",
         default="lancers_jobs.json",
         help=(
-            "Path to save parsed jobs JSON for the first URL "
-            "(second URL uses a parallel *_1.json name)"
+            "Legacy JSON snapshot path used only to seed MongoDB when the "
+            "collection is empty (second file uses a parallel *_1.json name)"
         ),
     )
     parser.add_argument(
@@ -1262,9 +1363,34 @@ def main() -> None:
     if poll_interval < 1:
         poll_interval = DEFAULT_POLL_INTERVAL_SEC
 
+    mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017").strip()
+    mongo_db = os.getenv("MONGODB_DB", "lancers").strip() or "lancers"
+    mongo_collection = (
+        os.getenv("MONGODB_COLLECTION", "post").strip() or "post"
+    )
+
+    try:
+        posts = get_mongo_collection(mongo_uri, mongo_db, mongo_collection)
+    except PyMongoError as exc:
+        raise SystemExit(
+            f"MongoDB connection failed ({mongo_uri} → {mongo_db}.{mongo_collection}): "
+            f"{exc}"
+        ) from exc
+
+    seeded = seed_mongo_from_json_files(
+        posts,
+        [args.save_json, _parallel_path(args.save_json)],
+    )
+    if seeded:
+        print(
+            f"Seeded {seeded} existing job URL(s) from legacy JSON into "
+            f"{mongo_db}.{mongo_collection}."
+        )
+
     mode = "once" if args.once else "continuous"
     print(
         f"Lancers monitor starting ({mode}). "
+        f"MongoDB: {mongo_db}.{mongo_collection}. "
         f"Poll interval: {poll_interval}s. Ctrl+C to stop."
     )
 
@@ -1322,6 +1448,7 @@ def main() -> None:
                         target=target,
                         cookie=cookie or None,
                         timeout=args.timeout,
+                        posts=posts,
                     )
                 except WafChallengeError as exc:
                     print(f"WAF challenge: {exc}")
@@ -1334,6 +1461,11 @@ def main() -> None:
                 except requests.RequestException as exc:
                     print(
                         f"Request error on target {target.label}: {exc}. "
+                        "Continuing with remaining targets."
+                    )
+                except PyMongoError as exc:
+                    print(
+                        f"MongoDB error on target {target.label}: {exc}. "
                         "Continuing with remaining targets."
                     )
 
