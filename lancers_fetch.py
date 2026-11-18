@@ -6,11 +6,15 @@ Monitors LANCERS_URL then optional LANCERS_URL1 sequentially in a continuous
 loop (real-time job watch). Seen job URLs are stored permanently in MongoDB
 (lancers.post) so reappearing listings are not treated as new.
 
-  LANCERS_URL  + TELEGRAM_BOT_TOKEN
-    -> HTML dump + Telegram bot 1
-  LANCERS_URL1 + TELEGRAM_BOT_TOKEN1
-    -> HTML dump + Telegram bot 2
+  LANCERS_URL  + TELEGRAM_BOT_TOKEN  + TELEGRAM_CHAT_ID
+    -> HTML dump + Telegram bot 1 -> group/channel (or private if unset)
+  LANCERS_URL1 + TELEGRAM_BOT_TOKEN1 + TELEGRAM_CHAT_ID1
+    -> HTML dump + Telegram bot 2 -> same or second destination
   Shared MongoDB: MONGODB_DB / MONGODB_COLLECTION (default lancers / post)
+
+Set TELEGRAM_CHAT_ID to your Lancers.jp group/channel id so alerts post
+there instead of private bot DMs. If TELEGRAM_CHAT_ID1 is omitted, bot 2
+reuses TELEGRAM_CHAT_ID.
 
 When new jobs are detected, each job detail page is fetched and parsed so
 Telegram messages include client verification, ratings, schedule, and the
@@ -20,6 +24,7 @@ Example:
   python lancers_fetch.py
   python lancers_fetch.py --once
   python lancers_fetch.py --interval 120
+  python lancers_fetch.py --discover-chats
 """
 
 from __future__ import annotations
@@ -1045,40 +1050,170 @@ def telegram_get_updates(
     return body.get("result", [])
 
 
-def extract_chat_id_from_update(update: Dict[str, object]) -> Optional[str]:
-    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+def extract_chat_from_update(
+    update: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    """
+    Return the chat object from a Telegram update.
+
+    Covers private messages, group messages, channel posts, and membership
+    events (my_chat_member / chat_member) which fire when a bot is added to
+    a group or channel.
+    """
+    for key in (
+        "message",
+        "edited_message",
+        "channel_post",
+        "edited_channel_post",
+        "my_chat_member",
+        "chat_member",
+    ):
         payload = update.get(key)
         if not isinstance(payload, dict):
             continue
         chat = payload.get("chat")
         if isinstance(chat, dict) and "id" in chat:
-            return str(chat["id"])
+            return chat
     return None
 
 
-def get_known_chat_ids(token: str, timeout: int) -> List[str]:
-    updates = telegram_get_updates(token, None, timeout)
+def extract_chat_id_from_update(update: Dict[str, object]) -> Optional[str]:
+    chat = extract_chat_from_update(update)
+    if not chat or "id" not in chat:
+        return None
+    return str(chat["id"])
+
+
+def parse_configured_chat_ids(raw: Optional[str]) -> List[str]:
+    """Parse TELEGRAM_CHAT_ID values: comma/space separated chat IDs."""
+    if not raw:
+        return []
     chat_ids: List[str] = []
+    seen = set()
+    for part in re.split(r"[\s,;]+", str(raw).strip()):
+        value = part.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        chat_ids.append(value)
+    return chat_ids
+
+
+def get_known_chats(token: str, timeout: int) -> List[Dict[str, object]]:
+    """Discover chats from recent getUpdates (id, type, title/username)."""
+    updates = telegram_get_updates(token, None, timeout)
+    chats: List[Dict[str, object]] = []
     seen = set()
     for upd in updates:
         if not isinstance(upd, dict):
             continue
-        chat_id = extract_chat_id_from_update(upd)
-        if not chat_id or chat_id in seen:
+        chat = extract_chat_from_update(upd)
+        if not chat or "id" not in chat:
+            continue
+        chat_id = str(chat["id"])
+        if chat_id in seen:
             continue
         seen.add(chat_id)
-        chat_ids.append(chat_id)
-    return chat_ids
+        chats.append(
+            {
+                "id": chat_id,
+                "type": str(chat.get("type") or ""),
+                "title": clean_text(str(chat.get("title") or "")) or "",
+                "username": clean_text(str(chat.get("username") or "")) or "",
+            }
+        )
+    return chats
 
 
-def get_startup_chat_ids(token: str, cache_file: str, timeout: int) -> List[str]:
+def get_known_chat_ids(token: str, timeout: int) -> List[str]:
+    return [str(chat["id"]) for chat in get_known_chats(token, timeout)]
+
+
+def rank_discovered_chat_ids(chats: List[Dict[str, object]]) -> List[str]:
+    """
+    Prefer groups/supergroups/channels over private DMs when auto-discovering.
+
+    This lets a bot that was previously used in private chat switch to a
+    shared group once the group appears in getUpdates.
+    """
+    priority = {
+        "channel": 0,
+        "supergroup": 1,
+        "group": 2,
+        "private": 3,
+    }
+    ordered = sorted(
+        chats,
+        key=lambda chat: (
+            priority.get(str(chat.get("type") or ""), 9),
+            str(chat.get("id") or ""),
+        ),
+    )
+    return [str(chat["id"]) for chat in ordered if chat.get("id")]
+
+
+def get_startup_chat_ids(
+    token: str,
+    cache_file: str,
+    timeout: int,
+    configured_chat_ids: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Resolve destination chat IDs for a bot.
+
+    Priority:
+      1. Explicit TELEGRAM_CHAT_ID / TELEGRAM_CHAT_ID1 (group/channel)
+      2. Cached chat IDs
+      3. Auto-discover from getUpdates (groups preferred over private)
+    """
+    configured = [
+        chat_id.strip()
+        for chat_id in (configured_chat_ids or [])
+        if str(chat_id).strip()
+    ]
+    if configured:
+        save_cached_chat_ids(cache_file, configured)
+        return configured
+
     cached = load_cached_chat_ids(cache_file)
     if cached:
         return cached
-    discovered = get_known_chat_ids(token, timeout)
+
+    discovered_chats = get_known_chats(token, timeout)
+    discovered = rank_discovered_chat_ids(discovered_chats)
     if discovered:
         save_cached_chat_ids(cache_file, discovered)
     return discovered
+
+
+def discover_telegram_chats_for_token(
+    label: str, token: str, timeout: int
+) -> None:
+    """Print chats visible to a bot via getUpdates (helper for setup)."""
+    print(f"\n=== Discover chats for bot {label} ===")
+    if not token:
+        print("Token is empty — set TELEGRAM_BOT_TOKEN / TELEGRAM_BOT_TOKEN1.")
+        return
+    try:
+        chats = get_known_chats(token, timeout)
+    except (requests.RequestException, RuntimeError) as exc:
+        print(f"getUpdates failed: {exc}")
+        return
+    if not chats:
+        print(
+            "No chats found yet. In the Lancers.jp group, send a message the "
+            "bot can see (e.g. /start@YourBotUsername), or temporarily disable "
+            "Group Privacy in @BotFather, then re-run with --discover-chats."
+        )
+        return
+    for chat in chats:
+        title = chat.get("title") or chat.get("username") or "(no title)"
+        print(
+            f"  id={chat.get('id')}  type={chat.get('type') or '?'}  "
+            f"title={title}"
+        )
+    preferred = rank_discovered_chat_ids(chats)
+    print(f"Suggested TELEGRAM_CHAT_ID value: {preferred[0]}")
 
 
 @dataclass
@@ -1091,6 +1226,7 @@ class WatchTarget:
     save_json: str
     telegram_token: str
     chat_cache_file: str
+    telegram_chat_ids: List[str] = field(default_factory=list)
 
 
 def _parallel_path(path: str, suffix: str = "_1") -> str:
@@ -1110,19 +1246,29 @@ def collect_watch_targets(
     telegram_token: str,
     telegram_token1: str,
     chat_cache_file: str,
+    telegram_chat_ids: Optional[List[str]] = None,
+    telegram_chat_ids1: Optional[List[str]] = None,
 ) -> List[WatchTarget]:
     """
     Build the ordered list of URLs to monitor.
 
     Defaults:
-      LANCERS_URL  + TELEGRAM_BOT_TOKEN
+      LANCERS_URL  + TELEGRAM_BOT_TOKEN  + TELEGRAM_CHAT_ID
         -> lancers_search.html / lancers_jobs.json / telegram_chat_ids.json
-      LANCERS_URL1 + TELEGRAM_BOT_TOKEN1
+      LANCERS_URL1 + TELEGRAM_BOT_TOKEN1 + TELEGRAM_CHAT_ID1
         -> lancers_search_1.html / lancers_jobs_1.json / telegram_chat_ids_1.json
+
+    If TELEGRAM_CHAT_ID1 is unset, target 2 reuses TELEGRAM_CHAT_ID so both
+    bots can post into the same group/channel.
 
     If --url is passed explicitly, only that single URL is monitored (using
     the primary token and --save-html / --save-json / --chat-cache-file).
     """
+    primary_chat_ids = list(telegram_chat_ids or [])
+    secondary_chat_ids = list(telegram_chat_ids1 or [])
+    if not secondary_chat_ids and primary_chat_ids:
+        secondary_chat_ids = list(primary_chat_ids)
+
     if cli_url is not None:
         return [
             WatchTarget(
@@ -1132,6 +1278,7 @@ def collect_watch_targets(
                 save_json=save_json,
                 telegram_token=telegram_token,
                 chat_cache_file=chat_cache_file,
+                telegram_chat_ids=primary_chat_ids,
             )
         ]
 
@@ -1145,6 +1292,7 @@ def collect_watch_targets(
             save_json=save_json,
             telegram_token=(telegram_token or "").strip(),
             chat_cache_file=chat_cache_file,
+            telegram_chat_ids=primary_chat_ids,
         )
     )
 
@@ -1158,6 +1306,7 @@ def collect_watch_targets(
                 save_json=_parallel_path(save_json),
                 telegram_token=(telegram_token1 or "").strip(),
                 chat_cache_file=_parallel_path(chat_cache_file),
+                telegram_chat_ids=secondary_chat_ids,
             )
         )
 
@@ -1218,20 +1367,30 @@ def process_watch_target(
     token_env = (
         "TELEGRAM_BOT_TOKEN" if target.label == "1" else "TELEGRAM_BOT_TOKEN1"
     )
+    chat_env = (
+        "TELEGRAM_CHAT_ID" if target.label == "1" else "TELEGRAM_CHAT_ID1"
+    )
     if not target.telegram_token:
         print(f"Telegram send skipped. {token_env} is not set.")
         return
 
     chat_ids = get_startup_chat_ids(
-        target.telegram_token, target.chat_cache_file, timeout
+        target.telegram_token,
+        target.chat_cache_file,
+        timeout,
+        configured_chat_ids=target.telegram_chat_ids,
     )
     if not chat_ids:
         print(
             f"No Telegram target chat found yet for bot {target.label}. "
-            "Open that bot and press Start once, then run the script again "
-            "for automatic delivery."
+            f"Set {chat_env} to your Lancers.jp group/channel id, or run "
+            "with --discover-chats after messaging the bot in that group."
         )
         return
+    if target.telegram_chat_ids:
+        print(
+            f"Using configured {chat_env}: {', '.join(chat_ids)}"
+        )
 
     total = len(new_jobs)
     enriched_jobs: List[Job] = []
@@ -1330,6 +1489,22 @@ def main() -> None:
         help="Telegram bot token for URL 2 (default: TELEGRAM_BOT_TOKEN1 in .env)",
     )
     parser.add_argument(
+        "--telegram-chat-id",
+        default=None,
+        help=(
+            "Destination group/channel chat id for bot 1 "
+            "(default: TELEGRAM_CHAT_ID in .env)"
+        ),
+    )
+    parser.add_argument(
+        "--telegram-chat-id1",
+        default=None,
+        help=(
+            "Destination group/channel chat id for bot 2 "
+            "(default: TELEGRAM_CHAT_ID1, else TELEGRAM_CHAT_ID)"
+        ),
+    )
+    parser.add_argument(
         "--chat-cache-file",
         default=DEFAULT_CHAT_CACHE_FILE,
         help=(
@@ -1350,6 +1525,14 @@ def main() -> None:
         action="store_true",
         help="Run a single monitor cycle and exit (disable continuous mode)",
     )
+    parser.add_argument(
+        "--discover-chats",
+        action="store_true",
+        help=(
+            "List Telegram chats visible to each bot via getUpdates, then exit. "
+            "Use this to find the Lancers.jp group/channel chat id."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -1362,6 +1545,26 @@ def main() -> None:
         poll_interval = DEFAULT_POLL_INTERVAL_SEC
     if poll_interval < 1:
         poll_interval = DEFAULT_POLL_INTERVAL_SEC
+
+    if args.discover_chats:
+        token1 = (
+            args.telegram_token
+            if args.telegram_token is not None
+            else os.getenv("TELEGRAM_BOT_TOKEN", "")
+        ).strip()
+        token2 = (
+            args.telegram_token1
+            if args.telegram_token1 is not None
+            else os.getenv("TELEGRAM_BOT_TOKEN1", "")
+        ).strip()
+        discover_telegram_chats_for_token("1", token1, args.timeout)
+        if token2:
+            discover_telegram_chats_for_token("2", token2, args.timeout)
+        print(
+            "\nPut the group/channel id into .env as TELEGRAM_CHAT_ID "
+            "(and TELEGRAM_CHAT_ID1 if different), then restart the monitor."
+        )
+        return
 
     mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017").strip()
     mongo_db = os.getenv("MONGODB_DB", "lancers").strip() or "lancers"
@@ -1417,6 +1620,17 @@ def main() -> None:
                 time.sleep(poll_interval)
                 continue
 
+            chat_ids_primary = parse_configured_chat_ids(
+                args.telegram_chat_id
+                if args.telegram_chat_id is not None
+                else os.getenv("TELEGRAM_CHAT_ID", "")
+            )
+            chat_ids_secondary = parse_configured_chat_ids(
+                args.telegram_chat_id1
+                if args.telegram_chat_id1 is not None
+                else os.getenv("TELEGRAM_CHAT_ID1", "")
+            )
+
             targets = collect_watch_targets(
                 env_url=os.getenv("LANCERS_URL", DEFAULT_URL),
                 env_url1=os.getenv("LANCERS_URL1", ""),
@@ -1434,6 +1648,8 @@ def main() -> None:
                     else os.getenv("TELEGRAM_BOT_TOKEN1", "")
                 ),
                 chat_cache_file=args.chat_cache_file,
+                telegram_chat_ids=chat_ids_primary,
+                telegram_chat_ids1=chat_ids_secondary,
             )
 
             print(
